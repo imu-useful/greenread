@@ -51,6 +51,7 @@ Core idea: [one sentence, e.g. "distraction-free reading with saved progress"].
 - Do not add crates without a clear reason; check the crate's maintenance status and license first.
 - Reading progress (position, bookmarks) is stored in `[path / table]`. Schema changes require a migration.
 - Run `cargo fmt`, `cargo clippy`, and `cargo test` before every commit.
+- Commit every code change. Once a change passes those checks, commit it right away. Do not leave modified code uncommitted or start the next stage or task on a dirty working tree. Stage work uses `stage N: short description`; other changes use conventional types (`fix: ...`, `docs: ...`, `refactor: ...`).
 
 ## Current focus
 - [Current task or milestone, e.g. "EPUB parser, basic window with chapter list"]
