@@ -8,3 +8,4 @@ description = "A desktop reader built with GTK4"
 
 [dependencies]
 gtk = { package = "gtk4", version = "0.11.5" }
+thiserror = "2.0.21"
