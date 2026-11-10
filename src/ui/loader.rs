@@ -13,13 +13,25 @@ pub enum LoadError {
     Panicked,
 }
 
-/// Parses the file on a GIO worker thread. Await this from the main context
-/// (e.g. inside `glib::spawn_future_local`) so the result lands on the UI thread.
-pub async fn load_book(path: PathBuf) -> Result<Book, LoadError> {
-    gio::spawn_blocking(move || PlainTextParser.parse(&path))
-        .await
-        .map_err(|_panic| LoadError::Panicked)?
-        .map_err(LoadError::from)
+/// A parsed book together with its canonical file path (the storage key).
+#[derive(Debug)]
+pub struct LoadedBook {
+    pub path: PathBuf,
+    pub book: Book,
+}
+
+/// Resolves the canonical path and parses the file on a GIO worker thread.
+/// Await this from the main context (e.g. inside `glib::spawn_future_local`)
+/// so the result lands on the UI thread.
+pub async fn load_book(path: PathBuf) -> Result<LoadedBook, LoadError> {
+    gio::spawn_blocking(move || {
+        // If canonicalising fails, parsing the original path reports the real error.
+        let path = path.canonicalize().unwrap_or(path);
+        let book = PlainTextParser.parse(&path)?;
+        Ok(LoadedBook { path, book })
+    })
+    .await
+    .map_err(|_panic| LoadError::Panicked)?
 }
 
 #[cfg(test)]
@@ -36,10 +48,11 @@ mod tests {
 
     #[test]
     fn loads_book_through_worker_pool() {
-        let book = glib::MainContext::new()
+        let loaded = glib::MainContext::new()
             .block_on(load_book(fixture("sample.txt")))
             .unwrap();
-        assert_eq!(book.chapters.len(), 4);
+        assert_eq!(loaded.book.chapters.len(), 4);
+        assert!(loaded.path.is_absolute());
     }
 
     #[test]

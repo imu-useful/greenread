@@ -2,9 +2,9 @@
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 
-use greenread::parsers::Book;
+use greenread::storage::ReadingPosition;
 use gtk::prelude::*;
 use gtk::{
     gio, glib, Application, ApplicationWindow, Button, FileDialog, FileFilter, HeaderBar, Label,
@@ -12,7 +12,8 @@ use gtk::{
 };
 
 use super::chapter_list::ChapterList;
-use super::loader;
+use super::loader::{self, LoadedBook};
+use super::progress::ProgressSync;
 use super::reader_view::ReaderView;
 
 const APP_TITLE: &str = "greenread";
@@ -31,12 +32,12 @@ const NOT_LOCAL_TEXT: &str = "Only local files can be opened.";
 ///
 /// Reuses the existing window if the application is activated again,
 /// so a second launch focuses the running instance instead of opening a duplicate.
-pub fn present_main_window(app: &Application) {
+pub fn present_main_window(app: &Application, progress: &Rc<ProgressSync>) {
     if let Some(window) = app.active_window() {
         window.present();
         return;
     }
-    let reader = ReaderWindow::new(app);
+    let reader = ReaderWindow::new(app, Rc::clone(progress));
     reader.window.present();
 }
 
@@ -46,13 +47,15 @@ struct ReaderWindow {
     message: Label,
     chapters: ChapterList,
     reader: ReaderView,
-    book: RefCell<Option<Book>>,
+    progress: Rc<ProgressSync>,
+    open_book: RefCell<Option<LoadedBook>>,
+    current_chapter: Cell<usize>,
     /// Incremented on every load so a slow, superseded load cannot overwrite a newer one.
     load_generation: Cell<u64>,
 }
 
 impl ReaderWindow {
-    fn new(app: &Application) -> Rc<Self> {
+    fn new(app: &Application, progress: Rc<ProgressSync>) -> Rc<Self> {
         let window = ApplicationWindow::builder()
             .application(app)
             .title(APP_TITLE)
@@ -97,7 +100,9 @@ impl ReaderWindow {
             message,
             chapters,
             reader,
-            book: RefCell::new(None),
+            progress,
+            open_book: RefCell::new(None),
+            current_chapter: Cell::new(0),
             load_generation: Cell::new(0),
         });
         this.connect_signals(&open_button);
@@ -114,11 +119,26 @@ impl ReaderWindow {
             }
         });
 
-        let weak: Weak<Self> = Rc::downgrade(self);
+        let weak = Rc::downgrade(self);
         self.chapters.connect_chapter_selected(move |index| {
             if let Some(this) = weak.upgrade() {
                 this.show_chapter(index);
             }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.reader.connect_scrolled(move || {
+            if let Some(this) = weak.upgrade() {
+                this.record_position();
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.window.connect_close_request(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.save_position_now();
+            }
+            glib::Propagation::Proceed
         });
     }
 
@@ -136,35 +156,75 @@ impl ReaderWindow {
     async fn load(&self, path: PathBuf) {
         let generation = self.load_generation.get() + 1;
         self.load_generation.set(generation);
+        self.save_position_now();
         self.stack.set_visible_child_name(PAGE_LOADING);
 
-        let result = loader::load_book(path).await;
-        if self.load_generation.get() != generation {
-            return;
-        }
-        match result {
-            Ok(book) => self.show_book(book),
-            Err(err) => self.show_message(&format!("Could not open the book: {err}")),
+        let loaded = match loader::load_book(path).await {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                if self.load_generation.get() == generation {
+                    self.show_message(&format!("Could not open the book: {err}"));
+                }
+                return;
+            }
+        };
+        let saved = self.progress.load(loaded.path.clone()).await;
+        if self.load_generation.get() == generation {
+            self.show_book(loaded, saved.unwrap_or_default());
         }
     }
 
-    fn show_book(&self, book: Book) {
-        self.window.set_title(Some(&book.title));
+    fn show_book(&self, loaded: LoadedBook, saved: ReadingPosition) {
+        self.window.set_title(Some(&loaded.book.title));
         self.chapters
-            .set_chapters(book.chapters.iter().map(|c| c.title.as_str()));
-        self.book.replace(Some(book));
+            .set_chapters(loaded.book.chapters.iter().map(|c| c.title.as_str()));
+        // A saved chapter beyond the end means the file changed; start over.
+        let start = if saved.chapter < loaded.book.chapters.len() {
+            saved
+        } else {
+            ReadingPosition::default()
+        };
+        self.open_book.replace(Some(loaded));
         self.stack.set_visible_child_name(PAGE_BOOK);
-        self.chapters.select(0);
+        self.chapters.select(start.chapter);
+        self.reader.scroll_to_char_offset(start.char_offset);
     }
 
     fn show_chapter(&self, index: usize) {
-        let book = self.book.borrow();
-        if let Some(chapter) = book.as_ref().and_then(|b| b.chapters.get(index)) {
-            self.reader.show_text(&chapter.text);
+        let open_book = self.open_book.borrow();
+        let Some(chapter) = open_book.as_ref().and_then(|b| b.book.chapters.get(index)) else {
+            return;
+        };
+        self.current_chapter.set(index);
+        self.reader.show_text(&chapter.text);
+        drop(open_book);
+        self.record_position();
+    }
+
+    fn current_position(&self) -> Option<(PathBuf, ReadingPosition)> {
+        let open_book = self.open_book.borrow();
+        let path = open_book.as_ref()?.path.clone();
+        let position = ReadingPosition {
+            chapter: self.current_chapter.get(),
+            char_offset: self.reader.top_char_offset(),
+        };
+        Some((path, position))
+    }
+
+    fn record_position(&self) {
+        if let Some((path, position)) = self.current_position() {
+            self.progress.record(path, position);
+        }
+    }
+
+    fn save_position_now(&self) {
+        if let Some((path, position)) = self.current_position() {
+            self.progress.save_now(path, position);
         }
     }
 
     fn show_message(&self, text: &str) {
+        self.open_book.replace(None);
         self.message.set_label(text);
         self.stack.set_visible_child_name(PAGE_MESSAGE);
     }

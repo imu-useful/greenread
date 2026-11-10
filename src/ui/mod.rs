@@ -2,5 +2,6 @@
 
 mod chapter_list;
 mod loader;
+pub mod progress;
 mod reader_view;
 pub mod window;
